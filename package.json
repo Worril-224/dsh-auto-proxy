@@ -1,9 +1,9 @@
 {
   "name": "@local/dsh-auto-proxy",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Routes the agent's GitHub, Hugging Face, npm and PyPI traffic through the local proxy this machine already runs.",
+  "description": "Routes the agent's GitHub, Hugging Face, npm and PyPI traffic through the local proxy this machine already runs, with macOS and Windows system-proxy detection.",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -11,12 +11,16 @@
   },
   "files": [
     "index.js",
+    "lib",
     "cordis.patch.yml",
     "locale/*.json",
     "docs",
     "README.md",
     "icon.svg"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

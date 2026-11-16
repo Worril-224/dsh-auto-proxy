@@ -1,26 +1,40 @@
 /**
- * dsh-net-proxy — keep the agent's outbound traffic on this machine's local proxy.
+ * dsh-auto-proxy — keep the agent's outbound traffic on this machine's local proxy.
  *
  * DSH reads `HTTPS_PROXY` / `HTTP_PROXY` only at launch, so a proxy that appears later (or whose
  * port changes when the proxy application restarts) leaves every request direct. This plugin
  * resolves the route at load time — explicit config, then an already-exported variable, then the
- * Windows system-proxy setting — and installs it for the whole process through the shipped
- * `@deepseek-ai/dsh-http-proxy` policy, which publishes the variables that every child process
- * (bash, pwsh, terminals, git, curl, pip) inherits and routes Node's `fetch` through the proxy too.
+ * operating system's proxy setting (macOS `scutil --proxy`, Windows Internet Settings) — and
+ * installs it for the whole process through the shipped `@deepseek-ai/dsh-http-proxy` policy,
+ * which publishes the variables that every child process (bash, pwsh, terminals, git, curl, pip)
+ * inherits and routes Node's `fetch` through the proxy too.
  *
- * It re-checks on a timer so a proxy that comes back on a different port is picked up without a
- * restart, and exposes `net_proxy` so the agent can inspect, repair, and test the route itself.
+ * It re-checks on a timer so a proxy that comes back on a different port, or whose bypass list
+ * changes, is picked up without a restart, and exposes `net_proxy` so the agent can inspect,
+ * repair, and test the route itself.
  *
- * @module @local/dsh-net-proxy
+ * @module @local/dsh-auto-proxy
  */
 
-import { execFile } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { normalizeConfig } from './lib/config.js'
+import {
+  DEFAULT_NO_PROXY,
+  DEFAULT_REFRESH_MS,
+  MAX_REFRESH_MS,
+  hasProxyCredentials,
+  maskCredentialsInText,
+  maskProxyUrl,
+  normalizeProxyUrl,
+  shExports,
+} from './lib/proxy.js'
+import { readSystemProxy } from './lib/system-proxy.js'
+
 /** Cordis plugin name; also the loader row id this package mounts under. */
-export const name = 'dsh-net-proxy'
+export const name = 'dsh-auto-proxy'
 
 /** Required services: the tool registry. `shellEnv` is looked up optionally. */
 export const inject = ['tools']
@@ -28,25 +42,40 @@ export const inject = ['tools']
 /** The shipped package that owns this installation's transport policy. */
 const PROXY_PACKAGE = '@deepseek-ai/dsh-http-proxy'
 
-/** Windows registry key holding the "system proxy" a browser obeys and a CLI tool never sees. */
-const INTERNET_SETTINGS = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
-
-/** Bypass entries always kept direct: the model API is domestic and must not depend on the proxy. */
-const DEFAULT_NO_PROXY = 'deepseek.com'
-
-/** How often the detected route is re-checked, in milliseconds. */
-const DEFAULT_REFRESH_MS = 60_000
+/** The shipped schema package that validates this plugin's row config when the loader loads it. */
+const SCHEMA_PACKAGE = '@deepseek-ai/schemastery'
 
 /** Length of the probe request's own budget, in milliseconds. */
 const PROBE_TIMEOUT_MS = 20_000
 
+/**
+ * Optional config schema. `@deepseek-ai/schemastery` ships with DSH, not with this profile
+ * package, so it is resolved from the installation at module load. When that resolution fails the
+ * plugin still mounts and `normalizeConfig` validates the same fields.
+ */
+const schema = await importPackage(SCHEMA_PACKAGE)
+const z = schema?.default ?? schema
+export const Config =
+  typeof z?.object === 'function'
+    ? z.object({
+        enabled: z.boolean().default(true),
+        autoDetect: z.boolean().default(true),
+        proxyUrl: z.string().default(''),
+        noProxy: z.string().default(DEFAULT_NO_PROXY),
+        nodeUseEnvProxy: z.boolean().default(true),
+        refreshIntervalMs: z
+          .union([z.number().min(0).max(MAX_REFRESH_MS), z.never()])
+          .default(DEFAULT_REFRESH_MS),
+      })
+    : undefined
+
 /** One mutable record of what this plugin installed, so every action reports the same truth. */
 class ProxyController {
   /**
-   * @param {object} config - normalized plugin configuration.
+   * @param {ReturnType<typeof normalizeConfig>} config - normalized plugin configuration.
    */
   constructor(config) {
-    /** @type {object} */
+    /** @type {ReturnType<typeof normalizeConfig>} */
     this.config = config
     /** @type {string | undefined} */
     this.url = undefined
@@ -64,6 +93,8 @@ class ProxyController {
     this.packageModule = undefined
     /** @type {string[]} */
     this.systemOverrideEntries = []
+    /** @type {string | undefined} */
+    this.installedNoProxy = undefined
     /** @type {Promise<unknown>} */
     this.queue = Promise.resolve()
     /** @type {Promise<unknown>} */
@@ -114,13 +145,19 @@ class ProxyController {
   }
 
   /**
-   * Resolve the route from the current machine state and install it when it differs.
+   * Resolve the route from the current machine state and install it when anything visible to
+   * consumers changed: the proxy URL or the effective bypass list.
    * @returns {Promise<void>}
    */
   async refresh() {
     if (!this.config.enabled) return
     const detected = await this.detect()
-    if (detected.url === this.url && this.dispose !== undefined) {
+    const nextNoProxy = this.effectiveNoProxy()
+    if (
+      detected.url === this.url &&
+      this.dispose !== undefined &&
+      nextNoProxy === this.installedNoProxy
+    ) {
       this.source = detected.source
       return
     }
@@ -136,7 +173,7 @@ class ProxyController {
     try {
       await this.installRoute(detected.url, detected.source)
     } catch (error) {
-      this.error = error instanceof Error ? error.message : String(error)
+      this.error = maskCredentialsInText(error instanceof Error ? error.message : String(error))
       this.url = undefined
       this.source = 'none'
     }
@@ -148,28 +185,62 @@ class ProxyController {
    */
   async detect() {
     this.systemOverrideEntries = []
+    // Clear the previous OS note here rather than only inside setSystemNotes: a config or
+    // environment route returns before the OS is read, and a stale note would otherwise survive.
+    this.notes = this.notes.filter(note => !note.startsWith('system proxy'))
     if (this.config.proxyUrl) return { url: this.config.proxyUrl, source: 'config' }
     const ambient = readAmbientProxy()
     // A value this plugin published itself is not an independent source; without this the timer
     // would keep re-deriving its own output and never notice the system setting change.
     if (ambient !== undefined && ambient !== this.url) return { url: ambient, source: 'environment' }
-    if (this.config.autoDetect && process.platform === 'win32') {
+    if (this.config.autoDetect) {
       const system = await readSystemProxy()
       this.systemOverrideEntries = system.overrideEntries
       this.setSystemNotes(system)
-      if (system.url !== undefined) return { url: system.url, source: 'windows-system-proxy' }
+      if (system.url !== undefined) return { url: system.url, source: system.source ?? 'system-proxy' }
     }
     return { url: undefined, source: 'none' }
   }
 
   /**
-   * Record what the registry contributed, without letting stale notes accumulate.
-   * @param {{ overrideEntries: string[], disabled: boolean }} system - the registry reading.
+   * Record what the operating system contributed, without letting stale notes accumulate.
+   * @param {import('./lib/system-proxy.js').SystemProxyReading} system - the OS reading.
    */
   setSystemNotes(system) {
     const kept = this.notes.filter(note => !note.startsWith('system proxy'))
     this.notes = kept
-    if (system.disabled) this.notes.push('system proxy setting is switched off (ProxyEnable = 0)')
+    if (system.unsupported) {
+      this.notes.push(
+        `system proxy detection is not available on ${system.platform}; set proxyUrl or export HTTPS_PROXY`,
+      )
+      return
+    }
+    if (system.unreadable) {
+      this.notes.push(
+        `system proxy setting could not be read${system.error === undefined ? '' : `: ${system.error}`}`,
+      )
+      return
+    }
+    if (system.disabled) {
+      this.notes.push(
+        system.platform === 'windows'
+          ? 'system proxy setting is switched off (ProxyEnable = 0)'
+          : system.platform === 'macos'
+            ? 'system proxy setting is switched off (HTTPEnable = 0, HTTPSEnable = 0)'
+            : 'system proxy setting is switched off',
+      )
+    }
+    if (system.socksOnly) {
+      this.notes.push(
+        'the system proxy is SOCKS-only; this plugin supports HTTP/HTTPS proxies, so it stays direct',
+      )
+    }
+    if (system.pacEnabled) {
+      this.notes.push('a PAC file or auto-discovery is configured; PAC routing is not supported and is ignored')
+    }
+    if (system.invalid) {
+      this.notes.push('the system proxy setting does not name a usable host:port pair; staying direct')
+    }
     if (system.overrideEntries.length > 0) {
       this.notes.push(
         `system proxy bypass entries that this plugin accepts: ${system.overrideEntries.join(', ')}`,
@@ -202,6 +273,7 @@ class ProxyController {
         restore()
       }
       this.dispatcherInstalled = false
+      this.installedNoProxy = noProxy
       this.notes.push(
         'the shipped proxy policy package could not be loaded, so only child processes are proxied; ' +
           'in-process fetch (web_fetch, web search, model calls) stays direct until DSH is restarted',
@@ -218,7 +290,8 @@ class ProxyController {
         await disposePolicy()
       }
       this.dispatcherInstalled = true
-      for (const message of diagnostics) this.notes.push(message)
+      this.installedNoProxy = noProxy
+      for (const message of diagnostics) this.notes.push(maskCredentialsInText(message))
     }
     this.url = url
     this.source = source
@@ -230,12 +303,15 @@ class ProxyController {
     const dispose = this.dispose
     this.dispose = undefined
     this.dispatcherInstalled = false
+    this.installedNoProxy = undefined
     if (dispose !== undefined) {
       try {
         await dispose()
       } catch (error) {
         this.notes.push(
-          `restoring the previous proxy state failed: ${error instanceof Error ? error.message : String(error)}`,
+          `restoring the previous proxy state failed: ${maskCredentialsInText(
+            error instanceof Error ? error.message : String(error),
+          )}`,
         )
       }
     }
@@ -248,27 +324,10 @@ class ProxyController {
    */
   async loadPackage() {
     if (this.packageModule !== undefined) return this.packageModule
-    for (const anchor of installationAnchors()) {
-      try {
-        const require = createRequire(pathToFileURL(path.join(anchor, 'package.json')).href)
-        const resolved = require.resolve(PROXY_PACKAGE)
-        const loaded = await import(pathToFileURL(resolved).href)
-        if (typeof loaded.installProxyFromEnvironment === 'function') {
-          this.packageModule = loaded
-          return loaded
-        }
-      } catch {
-        // Try the next anchor; the degradation is reported by installRoute when all of them fail.
-      }
-    }
-    try {
-      const loaded = await import(PROXY_PACKAGE)
-      if (typeof loaded.installProxyFromEnvironment === 'function') {
-        this.packageModule = loaded
-        return loaded
-      }
-    } catch {
-      // No resolution path reached it.
+    const loaded = await importPackage(PROXY_PACKAGE)
+    if (loaded !== undefined && typeof loaded.installProxyFromEnvironment === 'function') {
+      this.packageModule = loaded
+      return loaded
     }
     this.packageModule = null
     return null
@@ -310,6 +369,12 @@ class ProxyController {
     const active = this.url !== undefined && this.dispose !== undefined
     const notes = [...this.notes]
     if (this.error !== '') notes.push(this.error)
+    if (active && this.url !== undefined && hasProxyCredentials(this.url) && !notes.some(note => note.includes('credentials'))) {
+      notes.push(
+        'the proxy URL carries credentials; they are masked in this report and in shellExports — ' +
+          'replace *** with the real username and password before pasting the export lines',
+      )
+    }
     if (active) {
       notes.push(
         'a shell the agent starts from now on inherits this route; an already-running shell, and ' +
@@ -317,9 +382,15 @@ class ProxyController {
           'with — open a new shell, or export the variables above',
       )
     } else {
+      const systemSetting =
+        process.platform === 'darwin'
+          ? 'the macOS system proxy setting (scutil --proxy)'
+          : process.platform === 'win32'
+            ? 'the Windows system proxy setting (Internet Settings)'
+            : 'an operating-system proxy setting'
       notes.push(
         'no proxy route is installed: nothing was found in the plugin config, the proxy ' +
-          'environment variables, or the Windows system proxy setting',
+          `environment variables, or ${systemSetting}`,
       )
     }
     return {
@@ -343,123 +414,37 @@ function readAmbientProxy() {
   const names = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']
   for (const envName of names) {
     const value = process.env[envName]
-    if (typeof value === 'string' && value.trim() !== '') return normalizeProxyUrl(value)
+    if (typeof value !== 'string' || value.trim() === '') continue
+    const normalized = normalizeProxyUrl(value)
+    if (normalized !== undefined) return normalized
   }
   return undefined
 }
 
 /**
- * Read the Windows "system proxy" setting that browsers obey and command-line tools never see.
- * @returns {Promise<{ url: string | undefined, disabled: boolean, overrideEntries: string[] }>}
+ * Import one package that ships with DSH, resolving it from this installation first.
+ *
+ * A profile-installed bundle cannot resolve `@deepseek-ai/*` from its own directory: those
+ * packages live inside the DSH installation (and inside `app.asar` in Desktop), so every anchor
+ * this process can name is tried before giving the bare specifier a chance.
+ *
+ * @param {string} specifier - the package name.
+ * @returns {Promise<any>} the module namespace, or undefined when unreachable.
  */
-async function readSystemProxy() {
-  const enabled = await queryRegistry('ProxyEnable')
-  const disabled = enabled === undefined ? false : !/^0x0*1$|^1$/i.test(enabled.trim())
-  if (disabled) return { url: undefined, disabled: true, overrideEntries: [] }
-  const server = await queryRegistry('ProxyServer')
-  const override = await queryRegistry('ProxyOverride')
-  return {
-    url: parseProxyServer(server),
-    disabled: false,
-    overrideEntries: parseProxyOverride(override),
+async function importPackage(specifier) {
+  for (const anchor of installationAnchors()) {
+    try {
+      const require = createRequire(pathToFileURL(path.join(anchor, 'package.json')).href)
+      const resolved = require.resolve(specifier)
+      return await import(pathToFileURL(resolved).href)
+    } catch {
+      // Try the next anchor; the final fallback covers a plain Node installation.
+    }
   }
-}
-
-/**
- * Read one value from the Internet Settings key.
- * @param {string} valueName - the registry value name.
- * @returns {Promise<string | undefined>} its data, or undefined when absent or unreadable.
- */
-function queryRegistry(valueName) {
-  return new Promise(resolve => {
-    execFile(
-      'reg.exe',
-      ['query', INTERNET_SETTINGS, '/v', valueName],
-      { windowsHide: true, timeout: 5_000 },
-      (error, stdout) => {
-        if (error) {
-          resolve(undefined)
-          return
-        }
-        const match = /REG_[A-Z_]+\s+([^\r\n]*)/.exec(String(stdout))
-        resolve(match === null ? undefined : match[1].trim())
-      },
-    )
-  })
-}
-
-/**
- * Turn a `ProxyServer` value into one proxy URL: either a bare `host:port` or the per-scheme
- * `http=host:port;https=host:port` form.
- * @param {string | undefined} raw - the registry value.
- * @returns {string | undefined} the proxy URL, or undefined when it names no usable proxy.
- */
-function parseProxyServer(raw) {
-  if (raw === undefined || raw.trim() === '') return undefined
-  const value = raw.trim()
-  if (!value.includes('=')) return normalizeProxyUrl(value)
-  const perScheme = new Map()
-  for (const piece of value.split(';')) {
-    const separator = piece.indexOf('=')
-    if (separator < 0) continue
-    perScheme.set(piece.slice(0, separator).trim().toLowerCase(), piece.slice(separator + 1).trim())
-  }
-  return normalizeProxyUrl(perScheme.get('https') ?? perScheme.get('http') ?? '')
-}
-
-/**
- * Keep only the bypass entries this installation can actually match, so a wildcard form such as
- * `192.168.*` is not published as a rule that silently matches nothing.
- * @param {string | undefined} raw - the `ProxyOverride` value.
- * @returns {string[]} the usable entries.
- */
-function parseProxyOverride(raw) {
-  if (raw === undefined) return []
-  const entries = []
-  for (const piece of raw.split(';')) {
-    const entry = piece.trim()
-    if (entry === '' || entry.startsWith('<')) continue
-    if (entry.includes('*') || entry.includes('/') || entry.includes(' ')) continue
-    if (!entries.includes(entry)) entries.push(entry)
-  }
-  return entries
-}
-
-/**
- * Accept only an `http:` or `https:` proxy URL, adding `http://` to a bare `host:port`.
- * @param {string} value - the candidate.
- * @returns {string | undefined} a usable proxy URL without a trailing slash.
- */
-function normalizeProxyUrl(value) {
-  const trimmed = value.trim()
-  if (trimmed === '') return undefined
-  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`
-  let parsed
   try {
-    parsed = new URL(withScheme)
+    return await import(specifier)
   } catch {
     return undefined
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
-  if (parsed.hostname === '') return undefined
-  const href = parsed.href
-  return href.endsWith('/') && parsed.pathname === '/' && parsed.search === '' ? href.slice(0, -1) : href
-}
-
-/**
- * Hide a proxy password before the value reaches the model or the session log.
- * @param {string} value - the proxy URL.
- * @returns {string} the URL with any credentials replaced.
- */
-function maskProxyUrl(value) {
-  try {
-    const parsed = new URL(value)
-    if (parsed.username === '' && parsed.password === '') return value
-    parsed.username = '***'
-    parsed.password = '***'
-    return parsed.href
-  } catch {
-    return value
   }
 }
 
@@ -480,6 +465,7 @@ function installationAnchors() {
     }
   }
   remember(process.env.DSH_INSTALL_DIR ?? '')
+  remember(process.env.DSH_PROFILE_DIR ?? '')
   if (typeof process.resourcesPath === 'string') {
     remember(path.join(process.resourcesPath, 'app.asar', 'dsh'))
     remember(path.join(process.resourcesPath, 'app', 'dsh'))
@@ -529,51 +515,6 @@ function publishNodeUseEnvProxy(enabled) {
 }
 
 /**
- * Render the variables as shell lines, so a shell that predates the install can be repaired.
- * @param {string} url - the proxy URL.
- * @param {string} noProxy - the bypass list.
- * @returns {string} newline-separated `export` lines.
- */
-function shExports(url, noProxy) {
-  const lines = [`export HTTPS_PROXY=${url}`, `export HTTP_PROXY=${url}`]
-  if (noProxy !== '') lines.push(`export NO_PROXY=${noProxy}`)
-  return lines.join('\n')
-}
-
-/**
- * Normalize the raw loader row config. Every field is optional and validated here rather than
- * through a Config schema, so a bad value degrades with a note instead of failing the mount.
- * @param {unknown} raw - the row's `config` object.
- * @returns {object} the normalized configuration.
- */
-function normalizeConfig(raw) {
-  const input = raw !== null && typeof raw === 'object' ? raw : {}
-  /** @type {string[]} */
-  const notes = []
-  let proxyUrl = ''
-  if (typeof input.proxyUrl === 'string' && input.proxyUrl.trim() !== '') {
-    const normalized = normalizeProxyUrl(input.proxyUrl)
-    if (normalized === undefined) {
-      notes.push(`config proxyUrl "${input.proxyUrl}" is not an http(s) proxy URL; ignoring it`)
-    } else {
-      proxyUrl = normalized
-    }
-  }
-  const interval = Number(input.refreshIntervalMs)
-  return {
-    enabled: input.enabled !== false,
-    autoDetect: input.autoDetect !== false,
-    proxyUrl,
-    noProxy: typeof input.noProxy === 'string' ? input.noProxy.trim() : DEFAULT_NO_PROXY,
-    nodeUseEnvProxy: input.nodeUseEnvProxy !== false,
-    refreshIntervalMs: Number.isFinite(interval)
-      ? Math.min(Math.max(interval, 0), 3_600_000)
-      : DEFAULT_REFRESH_MS,
-    notes,
-  }
-}
-
-/**
  * Build the `net_proxy` tool over one controller.
  * @param {ProxyController} controller - the plugin's single route owner.
  * @returns {object} the tool definition for `ctx.tools.register`.
@@ -593,9 +534,10 @@ function buildTool(controller) {
         required: true,
         enum: ['status', 'refresh', 'test'],
         description:
-          'status reports the current route without changing it; refresh re-reads the config, ' +
-          'the environment and the Windows system proxy setting and installs the result; test ' +
-          'fetches one URL through the current route and reports status and latency.',
+          'status reports the current route without changing it; refresh re-detects the process ' +
+          'environment and the operating system proxy setting and installs the result (the plugin ' +
+          'config itself is fixed when the row mounts); test fetches one URL through the current ' +
+          'route and reports status and latency.',
       },
       url: {
         type: 'string',
@@ -671,7 +613,7 @@ async function probe(controller, url) {
       method: 'GET',
       redirect: 'follow',
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-      headers: { 'user-agent': 'dsh-net-proxy probe' },
+      headers: { 'user-agent': 'dsh-auto-proxy probe' },
     })
     await response.body?.cancel()
     return { probeUrl: url, probeStatus: response.status, probeMs: Date.now() - started, probeVia: via }
@@ -695,24 +637,22 @@ export function apply(ctx, rawConfig) {
   const controller = new ProxyController(config)
   if (config.notes.length > 0) controller.notes.push(...config.notes)
 
-  ctx.effect(() => {
-    controller.start()
-    return () => {
-      void controller.stop()
-    }
-  }, 'dsh-net-proxy: outbound proxy route and its re-check timer')
-
   ctx.effect(
-    () => ctx.tools.register(buildTool(controller)),
-    'dsh-net-proxy: the net_proxy tool',
+    () => {
+      controller.start()
+      return () => controller.stop()
+    },
+    'dsh-auto-proxy: outbound proxy route and its re-check timer',
   )
+
+  ctx.effect(() => ctx.tools.register(buildTool(controller)), 'dsh-auto-proxy: the net_proxy tool')
 
   const shellEnv = ctx.get('shellEnv')
   if (shellEnv !== undefined) {
     ctx.effect(
       () =>
         shellEnv.register({
-          name: 'dsh-net-proxy',
+          name: 'dsh-auto-proxy',
           variables: {
             DSH_PROXY_URL: {
               description: 'The outbound proxy URL this session routes through; empty when none is active.',
@@ -720,7 +660,7 @@ export function apply(ctx, rawConfig) {
           },
           resolve: () => (controller.url === undefined ? {} : { DSH_PROXY_URL: controller.url }),
         }),
-      'dsh-net-proxy: the DSH_PROXY_URL shell fact',
+      'dsh-auto-proxy: the DSH_PROXY_URL shell fact',
     )
   }
 }
