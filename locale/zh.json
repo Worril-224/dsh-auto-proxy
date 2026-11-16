@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "本地代理路由",
+    "description": "让 agent 访问 GitHub、Hugging Face、npm、PyPI 时自动走这台电脑上已经开着的本地代理，而不是去找镜像。加载时会依次读取插件配置、已导出的 HTTPS_PROXY / HTTP_PROXY、Windows 系统代理设置（代理软件写的那一份，命令行工具从来不读），然后把这条线路安装到整个进程：此后 agent 启动的每个 shell（bash、PowerShell、后台作业）及其中的 git、curl、pip、npm，以及 agent 自己的网页抓取。它每分钟重新检测一次，代理软件重启后换了端口也不需要重启 DSH；net_proxy 工具可以查看当前线路、按需重新检测、并实测一次请求的耗时。配置项：proxyUrl 固定一个代理；noProxy 追加必须直连的域名（默认 deepseek.com 直连，保证模型调用不依赖代理）；refreshIntervalMs 设置重检间隔，0 表示关闭；enabled: false 关闭路由；nodeUseEnvProxy（默认开启）让 npm 这类 Node 子进程也能读到变量。已经开着的 shell 与终端不会改变——可以再开一个 shell，或执行 net_proxy 返回的导出语句。代理地址会作为一个进程环境变量存在，任何命令都能读到它，包括里面可能带的密码。只支持 HTTP / HTTPS 代理：SOCKS 或 PAC 地址会被告知并保持直连。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}

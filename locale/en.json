@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Local proxy routing",
+    "description": "Routes the agent's GitHub, Hugging Face, npm and PyPI traffic through the local proxy this machine already runs, instead of switching to a mirror. At load it reads the plugin config, then an exported HTTPS_PROXY or HTTP_PROXY, then the Windows system-proxy setting — the one a proxy application writes and command-line tools never read — and installs that route for the whole process: every shell the agent starts from then on (bash, PowerShell, background jobs) plus git, curl, pip and npm inside it, and the agent's own page fetches. It re-checks every minute, so a proxy that comes back on a different port is picked up without restarting DSH, and the net_proxy tool reports the current route, re-detects it on demand, and times a test fetch. Settings: proxyUrl pins one proxy; noProxy adds hosts that stay direct (deepseek.com is direct by default, so model calls never depend on the proxy); refreshIntervalMs sets the re-check interval and 0 disables it; enabled: false turns routing off; nodeUseEnvProxy (on by default) also lets Node-based child tools such as npm read the variables. Shells and terminals that were already running keep the environment they started with — open a new shell, or export the lines net_proxy returns. The proxy URL becomes a process environment variable, so any command can read it, including a password inside it. HTTP and HTTPS proxies only: a SOCKS or PAC value is reported and left direct.",
+    "detail": "docs/DETAIL.md"
+  }
+}

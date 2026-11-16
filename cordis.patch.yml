@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-auto-proxy
+      name: '@local/dsh-auto-proxy'
