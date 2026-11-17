@@ -4,7 +4,7 @@
 
 支持 **macOS** 与 **Windows**：macOS 读 `scutil --proxy`，Windows 读
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`。两个平台使用同一份插件代码，在运行时按
-`process.platform` 分派；`release/` 里的两个版本只是按平台标注、分别打包，安装任意一个都能在两种系统上运行。
+`process.platform` 分派，不需要分别打包。
 
 ## 它做什么
 
@@ -72,45 +72,52 @@
 
 ## 安装
 
+插件就是一个普通的 DSH bundle，直接从本仓库安装，没有预打包的分发目录。
+
 ### 插件面板
 
-打开 DSH 的 **插件** → **添加插件**，选择 `release/macos/dsh-auto-proxy` 或
-`release/windows/dsh-auto-proxy` 目录。安装后重启 DSH（替换已装载的 JS 模块需要重启；首次安装通常可以热加载）。
+打开 DSH 的 **插件** → **添加插件**，选择本仓库根目录（含 `package.json` 与 `cordis.patch.yml` 的那一层）。
+首次安装通常可以热加载；但如果同一个 DSH 进程里换过安装来源（例如从本地目录换成 `github:`），装载器会记住旧的
+模块路径，此时需要重启 DSH 才能重新解析。
 
 ### 交给 agent / `plugin_manager`
 
 ```text
-plugin_manager install_bundle target: "<本仓库绝对路径>/release/macos/dsh-auto-proxy"
+# 装 GitHub 上的版本
+plugin_manager install_bundle target: "github:Worril-224/dsh-auto-proxy"
+
+# 或者装本地目录（绝对路径，适合边改边试）
+plugin_manager install_bundle target: "<本仓库绝对路径>"
 ```
 
-装完把 `@local/dsh-auto-proxy` 加进 profile 的 `dsh.profile.bundles`（`set_bundle`）。
+安装会把包写进 profile 的 `dependencies`，并把 `@local/dsh-auto-proxy` 自动追加进 `dsh.profile.bundles`。
+`github:` 说明会被 pnpm 锁到一个具体 commit，所以已装的副本不会因为上游 push 而自动变新，更新要重装一次：
+
+```text
+plugin_manager remove_bundle  @local/dsh-auto-proxy
+plugin_manager install_bundle github:Worril-224/dsh-auto-proxy
+```
 
 ### 本地开发
 
 ```sh
-# 不碰 profile 的装载测试
-ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" tools/mount-test.mjs src '{}'
+# 纯函数测试（node:test，Node 20+）
+node --test test/*.test.mjs
 
-# 纯函数测试
-cd src && npm test
+# 没有全局 node 时，用 DSH 自带的运行时跑同一套测试
+ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" --test test/config.test.mjs test/proxy.test.mjs test/system-proxy.test.mjs
 ```
 
-## 构建 release
-
-```sh
-node tools/build-release.mjs
-```
-
-输出：
+## 仓库结构
 
 ```text
-release/
-├── macos/dsh-auto-proxy/           # 可直接“添加插件”的目录
-├── windows/dsh-auto-proxy/         # 同上
-├── dsh-auto-proxy-1.1.0-macos.zip
-├── dsh-auto-proxy-1.1.0-windows.zip
-├── SHA256SUMS.txt
-└── README.md
+index.js              插件入口：工具注册、线路控制器、定时重检
+lib/config.js         配置归一化与校验（Config schema 不可用时的兜底）
+lib/proxy.js          代理 URL 归一化、凭据脱敏、shell 导出语句
+lib/system-proxy.js   macOS scutil / Windows 注册表的系统代理读取
+test/                 node:test 单元测试（25 个用例）
+locale/               en / zh 界面文案
+docs/                 插件详情页文案与预览图
 ```
 
 ## 边界
